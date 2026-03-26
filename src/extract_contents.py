@@ -1,10 +1,13 @@
 import csv, json, os, sys, time
 from pathlib import Path
 import pdfplumber
-from openai import OpenAI
+#from openai import OpenAI
+from google import genai
+from google.genai import types
+import numpy as np
 
 
-MODEL = 'gpt-4o'
+MODEL = 'gemini-3-flash-preview'
 PAGES_PER_BATCH = 4
 MAX_LENGTH = 4000
 RETRY_ATTEMPTS = 3
@@ -48,8 +51,8 @@ Return only a JSON object with key "variables" containing an array as described.
 
 input_tokens = 0
 output_tokens = 0
-client = OpenAI()
-def call_gpt(text, start_page, end_page, num_pages):
+client = genai.Client()
+def call_gemini(text, start_page, end_page, num_pages):
     prompt = USER_TEMPLATE.format(
         start= start_page,
         end= end_page,
@@ -57,26 +60,34 @@ def call_gpt(text, start_page, end_page, num_pages):
         text= text
     )
 
-    for attempt in range(1, RETRY_ATTEMPTS+1):
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            response = client.chat.completions.create(
+            response = client.models.generate_content(
                 model= MODEL,
-                response_format= {'type': 'json_object'},
-                messages= [
-                    {'role': 'system', 'content': SYSTEM_PROMPT},
-                    {'role': 'user', 'content': prompt}
-                ]
+                contents= [
+                    types.Content(
+                        role= 'user',
+                        parts= [ types.Part.from_text(text= prompt) ]
+                    )
+                ],
+                config= types.GenerateContentConfig(
+                    system_instruction= SYSTEM_PROMPT,
+                    response_mime_type= 'application/json'
+                )
             )
-            raw = response.choices[0].message.content.strip()
+            raw = response.text.strip()
             parsed = json.loads(raw)
             
             if isinstance(parsed, dict):
                 parsed = next(iter(parsed.values()))
             
-            return parsed if isinstance(parsed, list) else [], response.usage.prompt_tokens, response.usage.completion_tokens
+            in_tok = getattr(response.usage_metadata, 'prompt_token_count', 0) or 0
+            out_tok = getattr(response.usage_metadata, 'candidates_token_count', 0) or 0
+            
+            return parsed if isinstance(parsed, list) else [], in_tok, out_tok
         except json.JSONDecodeError as err:
             print(f"    Parse error: {err}")
-            return []
+            return [], 0, 0
         except Exception as err:
             status = getattr(err, 'status_code', None)
             if status in (429, 503):
@@ -87,7 +98,7 @@ def call_gpt(text, start_page, end_page, num_pages):
                 if attempt < RETRY_ATTEMPTS:
                     time.sleep(RETRY_DELAY)
 
-    return []
+    return [], 0, 0
 
 
 def extract_pages(pdf_path):
@@ -124,7 +135,7 @@ def process_pdf(input_tokens, output_tokens, pdf_path, pages_per_batch= PAGES_PE
         text = '\n\n'.join([page['text'] for page in batch if page['text']])
         print(f"   Batch {i+1}/{len(batches)}: pages {start_page}-{end_page}...", end= '', flush= True)
 
-        variables, in_tok, out_tok = call_gpt(text, start_page, end_page, num_pages)
+        variables, in_tok, out_tok = call_gemini(text, start_page, end_page, num_pages)
         input_tokens += in_tok
         output_tokens += out_tok
 
@@ -168,9 +179,9 @@ def process_pdf(input_tokens, output_tokens, pdf_path, pages_per_batch= PAGES_PE
         time.sleep(0.3)
 
     print(f"   Complete! {len(rows)} rows extracted")
-    GPT4O_INPUT  = 2.50 / 1_000_000
-    GPT4O_OUTPUT = 10.00 / 1_000_000
-    cost = (input_tokens * GPT4O_INPUT) + (output_tokens * GPT4O_OUTPUT)
+    GEMINI_INPUT  = 0.50 / 1_000_000
+    GEMINI_OUTPUT = 3.00 / 1_000_000
+    cost = (input_tokens * GEMINI_INPUT) + (output_tokens * GEMINI_OUTPUT)
     print(f"   Tokens: {input_tokens:,} in / {output_tokens:,} out = ${cost:.4f}")
 
     return rows, input_tokens, output_tokens
@@ -198,10 +209,17 @@ def sort_key(path):
 
 codebooks_dir = 'intermediate/codebooks'
 codebooks_pdfs = [os.path.join(codebooks_dir, pdf) for pdf in os.listdir(codebooks_dir)]
-codebooks_pdfs = sorted(codebooks_pdfs, key= sort_key)[1112:1114]
+codebooks_pdfs = sorted(codebooks_pdfs, key= sort_key)
+
+test_codebooks = []
+while len(test_codebooks) < 10:
+    tmp_pdf = codebooks_pdfs[np.random.randint(high= len(codebooks_pdfs))]
+    with pdfplumber.open(tmp_pdf) as pdf:
+        if len(pdf.pages) < 100 and tmp_pdf not in test_codebooks:
+            test_codebooks.append(tmp_pdf)
 
 content = []
-for pdf_path in codebooks_pdfs:
+for pdf_path in test_codebooks:
     print(pdf_path)
     if not os.path.exists(pdf_path):
         print(f"   File not found: {pdf_path}", file= sys.stderr)
