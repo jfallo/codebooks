@@ -11,3 +11,7 @@ venv/
 node_modules/
 package-lock.json
 package.json
+
+# junk
+.DS_Store
+src/.DS_Store
