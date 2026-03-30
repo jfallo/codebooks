@@ -2,41 +2,69 @@ import csv, json, os, sys, time
 from pathlib import Path
 import pdfplumber
 from openai import OpenAI
+import numpy as np
 
 
-MODEL = 'gpt-4o-mini'
+MODEL = 'gpt-5.4'
 PAGES_PER_BATCH = 4
 MAX_LENGTH = 4000
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 5
 
-GET_VARIABLES_PROMPT = """
+SYSTEM_PROMPT = """
 You are a precise data extractor for social science codebooks.
-Your job is to extract every variable/question/option from the provided codebook text and return a structured JSON.
+Your job is to extract every variable and question from the provided codebook text and return a structured JSON.
  
 Return ONLY a JSON object with a single key "variables" whose value is an array of variable objects.
  
 Each variable object must have:
-  - "id": a unique identifier for this item and its parent/children.
-  - "name": short variable identifier (e.g. "CSEX", "V23", "Q5A", "State Name", "Identification Number"). Null if not present.
-  - "type": one of "variable" (administrative/demographic field), "question" (survey question posed to respondent), or "option" (a response option).
+  - "id": a unique identifier for this item.
+  - "name": short variable identifier (e.g. "CSEX", "V23", "Q5A", "State Name", "Identification Number"). Empty string if not present.
+  - "type": "variable" (administrative/demographic field) or "question" (survey question posed to respondent).
   - "description": full question text or variable description.
   - "codes": array of {"value": "...", "label": "..."} pairs. Empty array [] if no coded values.
  
 Important:
-  - Include ALL variables/questions/options found, even if they have no codes (e.g. open-ended or continuous).
-  - "id" should be an integer. Set the "id" of the first item equal to 1, the second item 2, and so on. Options should use the same id of the parent question/variable they belong to.
-  - Populate option "id", "name", and "description" with the same values as the parent question/variable. Do not copy "type".
+  - Include ALL variables and questions found, even if they have no codes (e.g. open-ended or continuous).
+  - Do not include code values in "name" or "description".
+  - "id" increments for each new variable or question.
   - Skip administrative and layout text (page headers, footers, titles, section dividers).
   - Preserve the original wording of descriptions.
-  - If the page does not contain any variables, return {"variables": []}.
-  - Do NOT extract response statistics (e.g. frequency, percentage, mean, median, number of responses etc.). We are only interested in the framing and structure of variables/questions/options.
-  - Do not name a variable by the variable/question/option value. If there is no name then set name to be "".
-  - If the "value" or "label" of a variable is blank then leave them as an empty string e.g. {"value": "", "label": ""}. However, do not ignore one if it exists and the other does not.
+  - If the page does not contain any variables or questions, return {"variables": []}.
+  - Do NOT extract response statistics (e.g. frequency, percentage, mean, median, number of responses etc.). We are only interested in the framing and structure of variables and questions.
+  - If the "value" or "label" of a code is blank, then leave it as an empty string e.g. {"value": "", "label": ""}. Do not ignore one if it exists and the other is blank.
+  - Pay extra attention to codes. It is most important that you correctly identify code values and labels.
+
+Example:
+{
+  "variables": [
+    {
+        "id": 1,
+        "name": "FIPSTATE",
+        "type": "variable",
+        "description": "FIPS State Code",
+        "codes": [{"value": "1", "label": "Alabama"}, {"value": "2", "label": "Alaska"}]
+    },
+    {
+        "id": 2,
+        "name": "",
+        "type": "question",
+        "description": "Do you approve or disapprove of the way Bill Clinton is handling foreign affairs?",
+        "codes": [{"value": "1", "label": "Approve"}, {"value": "2", "label": "Disapprove"}]
+    },
+    {
+        "id": 3,
+        "name": "Income",
+        "type": "question",
+        "description": "What is your yearly income?",
+        "codes": []
+    }
+  ]
+}
 """
 
 USER_TEMPLATE = """
-Extract all variables, questions, and options from codebook pages {start}-{end} of {num_pages}.
+Extract all variables and questions from codebook pages {start}-{end} of {num_pages}.
 
 --- BEGIN CODEBOOK TEXT ---
 {text}
@@ -45,66 +73,49 @@ Extract all variables, questions, and options from codebook pages {start}-{end} 
 Return only a JSON object with key "variables" containing an array as described.
 """
 
-CLEAN_VARIABLES_PROMPT = """
-You are cleaning OCR-extracted survey codebook metadata.
+CONTINUE_TEMPLATE = """
 
-You will receive a JSON list of variables. Each has:
-  - "id": a unique identifier for this item and its parent/children.
-  - "name": short variable identifier (e.g. "CSEX", "V23", "Q5A", "State Name", "Identification Number"). Null if not present.
-  - "type": one of "variable" (administrative/demographic field), "question" (survey question posed to respondent), or "option" (a response option).
-  - "description": full question text or variable description.
-  - "codes": array of {"value": "...", "label": "..."} pairs. Empty array [] if no coded values.
- 
-
-Task:
-Fix OCR typos and formatting issues in:
-- name
-- description
-- codes
-
-Important:
-- DO NOT change id fields.
-- DO NOT add or remove codes.
-- DO NOT create new variables.
-- Only correct spelling, spacing, punctuation, and OCR errors (e.g. "RE4SONSF OR UAICINGF U BETTERO FF" -> "REASONS FOR MAKING FU BETTER OFF").
-- Preserve meaning.
-
-Return ONLY valid JSON (no markdown, no commentary).
-
-Input JSON:
+The following variable was incomplete at the end of the previous page and may continue here:
+{last_var}
+Continue extracting its codes if present, then proceed with new variables. Do not re-emit codes already listed in the carried-over variable — only add newly seen codes.
 """
 
 
 input_tokens = 0
 output_tokens = 0
 client = OpenAI()
-def get_variables_with_gpt(text, start_page, end_page, num_pages):
-    prompt = USER_TEMPLATE.format(
+def call_gpt(text, start_page, end_page, num_pages, last_var):
+    user_prompt = USER_TEMPLATE.format(
         start= start_page,
         end= end_page,
         num_pages= num_pages,
         text= text
     )
+    syst_prompt = SYSTEM_PROMPT
+    if last_var:
+        syst_prompt += CONTINUE_TEMPLATE.format(last_var= json.dumps(last_var))
 
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
+    for attempt in range(1, RETRY_ATTEMPTS+1):
         try:
             response = client.chat.completions.create(
                 model= MODEL,
                 response_format= {'type': 'json_object'},
                 messages= [
-                    {'role': 'system', 'content': GET_VARIABLES_PROMPT},
-                    {'role': 'user', 'content': prompt}
+                    {'role': 'system', 'content': syst_prompt},
+                    {'role': 'user', 'content': user_prompt}
                 ]
             )
             raw = response.choices[0].message.content.strip()
             parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                parsed = next(iter(parsed.values()))
             
-            return parsed if isinstance(parsed, list) else [], response.usage.prompt_tokens, response.usage.completion_tokens
+            if isinstance(parsed, dict):
+                parsed = parsed.get("variables", [])
+            last_var = parsed[-1] if parsed else {}
+            
+            return parsed if isinstance(parsed, list) else [], response.usage.prompt_tokens, response.usage.completion_tokens, last_var
         except json.JSONDecodeError as err:
             print(f"    Parse error: {err}")
-            return [], 0, 0
+            return [], 0, 0, {}
         except Exception as err:
             status = getattr(err, 'status_code', None)
             if status in (429, 503):
@@ -115,45 +126,7 @@ def get_variables_with_gpt(text, start_page, end_page, num_pages):
                 if attempt < RETRY_ATTEMPTS:
                     time.sleep(RETRY_DELAY)
 
-    return [], 0, 0
-
-def clean_variables_with_gpt(variables):
-    if not variables:
-        return [], 0, 0
-
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        try:
-            response = client.chat.completions.create(
-                model= MODEL,
-                response_format= {'type': 'json_object'},
-                messages= [
-                    {
-                        'role': 'user', 
-                        'content': CLEAN_VARIABLES_PROMPT + json.dumps(variables, ensure_ascii= False)
-                    }
-                ]
-            )
-            raw = response.choices[0].message.content.strip()
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                parsed = next(iter(parsed.values()))
-            cleaned = parsed if isinstance(parsed, list) else variables
-            
-            return cleaned, response.usage.prompt_tokens, response.usage.completion_tokens
-        except json.JSONDecodeError as err:
-            print(f"    Clean parse error: {err}")
-            return variables, 0, 0
-        except Exception as err:
-            status = getattr(err, 'status_code', None)
-            if status in (429, 503):
-                print(f"    Rate limit. Retrying ({attempt}/{RETRY_ATTEMPTS})...")
-                time.sleep(RETRY_DELAY * attempt)
-            else:
-                print(f"    API error: {err}")
-                if attempt < RETRY_ATTEMPTS:
-                    time.sleep(RETRY_DELAY)
-
-    return variables, 0, 0
+    return [], 0, 0, {}
 
 
 def extract_pages(pdf_path):
@@ -179,8 +152,9 @@ def process_pdf(input_tokens, output_tokens, pdf_path, pages_per_batch= PAGES_PE
     pages, num_pages = extract_pages(pdf_path)
     print(f"   {num_pages} pages total, {len(pages)} with extractable text")
     batches = batch_pages(pages, pages_per_batch)
+    rows = []
 
-    variables = []
+    last_var = {}
     for i, batch in enumerate(batches):
         start_page = batch[0]['page_num']
         end_page = batch[-1]['page_num']
@@ -188,56 +162,50 @@ def process_pdf(input_tokens, output_tokens, pdf_path, pages_per_batch= PAGES_PE
         if all(not page['text'] for page in batch):
             continue
         text = '\n\n'.join([page['text'] for page in batch if page['text']])
-        print(f"   Batch {i+1}/{len(batches)}: pages {start_page}-{end_page}...")
+        print(f"   Batch {i+1}/{len(batches)}: pages {start_page}-{end_page}...", end= '', flush= True)
 
-        vars, in_tok, out_tok = get_variables_with_gpt(text, start_page, end_page, num_pages)
+        variables, in_tok, out_tok, last_var = call_gpt(text, start_page, end_page, num_pages, last_var)
         input_tokens += in_tok
         output_tokens += out_tok
 
-        for var in vars:
-            var['_page_range'] = f"{start_page}-{end_page}"
+        batch_rows = 0
+        for var in variables:
+            if not isinstance(var, dict):
+                continue
+            var_id = var.get('id') or ''
+            var_name = var.get('name') or ''
+            var_type = var.get('type') or ''
+            description = var.get('description') or ''
+            codes = var.get('codes') or []
 
-        variables.extend(vars)
-        time.sleep(0.3)
-        
-    variables, in_tok, out_tok = clean_variables_with_gpt(variables)
-    input_tokens += in_tok
-    output_tokens += out_tok
-
-    rows = []
-    for var in variables:
-        if not isinstance(var, dict):
-            continue
-        var_id = var.get('id') or ''
-        var_name = var.get('name') or ''
-        var_type = var.get('type') or ''
-        description = var.get('description') or ''
-        codes = var.get('codes') or []
-        page_range = var.get('_page_range', '')
-
-        if codes:
-            for code in codes:
+            if codes:
+                for code in codes:
+                    rows.append({
+                        'id': var_id,
+                        'name': var_name,
+                        'type': var_type,
+                        'description': description,
+                        'value': code.get('value', ''),
+                        'label': code.get('label', ''),
+                        'source_file': Path(pdf_path).name,
+                        'page_range': f'{start_page}-{end_page}'
+                    })
+                    batch_rows += 1
+            else:
                 rows.append({
                     'id': var_id,
                     'name': var_name,
                     'type': var_type,
                     'description': description,
-                    'value': code.get('value', ''),
-                    'label': code.get('label', ''),
+                    'value': '',
+                    'label': '',
                     'source_file': Path(pdf_path).name,
-                    'page_range': page_range
+                    'page_range': f'{start_page}-{end_page}'
                 })
-        else:
-            rows.append({
-                'id': var_id,
-                'name': var_name,
-                'type': var_type,
-                'description': description,
-                'value': '',
-                'label': '',
-                'source_file': Path(pdf_path).name,
-                'page_range': page_range
-            })
+                batch_rows += 1
+
+        print(f"{len(variables)} variables, {batch_rows} rows")
+        time.sleep(0.3)
 
     print(f"   Complete! {len(rows)} rows extracted")
     GPT4O_INPUT  = 2.50 / 1_000_000
@@ -272,10 +240,15 @@ codebooks_dir = 'intermediate/codebooks'
 codebooks_pdfs = [os.path.join(codebooks_dir, pdf) for pdf in os.listdir(codebooks_dir)]
 codebooks_pdfs = sorted(codebooks_pdfs, key= sort_key)
 
-codebooks_pdfs = [os.path.join(codebooks_dir, "08731-0001-Codebook.pdf")]
+test_codebooks = []
+while len(test_codebooks) < 5:
+    tmp_pdf = codebooks_pdfs[np.random.randint(0, len(codebooks_pdfs)-1)]
+    with pdfplumber.open(tmp_pdf) as pdf:
+        if len(pdf.pages) < 100 and tmp_pdf not in test_codebooks:
+            test_codebooks.append(tmp_pdf)
 
 content = []
-for pdf_path in codebooks_pdfs:
+for pdf_path in test_codebooks:
     print(pdf_path)
     if not os.path.exists(pdf_path):
         print(f"   File not found: {pdf_path}", file= sys.stderr)
