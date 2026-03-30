@@ -213,7 +213,7 @@ codebooks_pdfs = sorted(codebooks_pdfs, key= sort_key)
 
 test_codebooks = []
 while len(test_codebooks) < 10:
-    tmp_pdf = codebooks_pdfs[np.random.randint(high= len(codebooks_pdfs))]
+    tmp_pdf = codebooks_pdfs[np.random.randint(0, len(codebooks_pdfs)-1)]
     with pdfplumber.open(tmp_pdf) as pdf:
         if len(pdf.pages) < 100 and tmp_pdf not in test_codebooks:
             test_codebooks.append(tmp_pdf)
