@@ -3,9 +3,10 @@ from pathlib import Path
 import pdfplumber
 from openai import OpenAI
 import numpy as np
+np.random.seed(100)
 
 
-MODEL = 'gpt-5.4'
+MODEL = 'gpt-4o'
 PAGES_PER_BATCH = 4
 MAX_LENGTH = 4000
 RETRY_ATTEMPTS = 3
@@ -14,16 +15,16 @@ RETRY_DELAY = 5
 SYSTEM_PROMPT = """
 You are a precise data extractor for social science codebooks.
 Your job is to extract every variable and question from the provided codebook text and return a structured JSON.
- 
+
 Return ONLY a JSON object with a single key "variables" whose value is an array of variable objects.
- 
+
 Each variable object must have:
   - "id": a unique identifier for this item.
   - "name": short variable identifier (e.g. "CSEX", "V23", "Q5A", "State Name", "Identification Number"). Empty string if not present.
   - "type": "variable" (administrative/demographic field) or "question" (survey question posed to respondent).
   - "description": full question text or variable description.
   - "codes": array of {"value": "...", "label": "..."} pairs. Empty array [] if no coded values.
- 
+
 Important:
   - Include ALL variables and questions found, even if they have no codes (e.g. open-ended or continuous).
   - Do not include code values in "name" or "description".
@@ -69,7 +70,7 @@ Extract all variables and questions from codebook pages {start}-{end} of {num_pa
 --- BEGIN CODEBOOK TEXT ---
 {text}
 --- END CODEBOOK TEXT ---
- 
+
 Return only a JSON object with key "variables" containing an array as described.
 """
 
